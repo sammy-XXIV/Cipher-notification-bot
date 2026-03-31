@@ -153,7 +153,8 @@ def handle_update(update):
             f"<code>{code}</code>\n\n"
             f"Enter this code on <b>tradewithcipher.online</b>\n"
             f"Settings → Notifications → Link Telegram\n\n"
-            f"⏱ Code expires in <b>10 minutes</b>"
+            f"⏱ Code expires in <b>10 minutes</b>\n\n"
+            f"<i>@Cipher_notificationbot</i>"
         )
         log.info(f"Sent code {code} to {chat_id} (@{username})")
 
@@ -215,6 +216,10 @@ def keep_alive_loop():
 def polling_loop():
     offset = None
     clear_updates()
+    # Drain any queued updates on startup
+    updates = tg_get_updates(offset)
+    if updates:
+        offset = updates[-1]["update_id"] + 1
     log.info("Notification bot polling started")
     while True:
         updates = tg_get_updates(offset)
@@ -312,3 +317,4 @@ if __name__ == '__main__':
     log.info("CIPHER Notification Bot started")
     port = int(os.environ.get("PORT", 5002))
     app.run(host='0.0.0.0', port=port, debug=False)
+
