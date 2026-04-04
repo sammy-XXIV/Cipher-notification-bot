@@ -232,10 +232,65 @@ def polling_loop():
         time.sleep(1)
 
 # ============================================================
-# SIGNAL MONITOR — stores and monitors active signals 24/7
+# SIGNAL STORAGE — Supabase (survives restarts)
 # ============================================================
-# In-memory store: { user_id: { symbol: signal_data } }
-active_signals = {}
+def save_signal(user_id, symbol, signal, entry, target, stop, timeframe, price):
+    """Save/update signal in Supabase"""
+    sb_request("POST", "active_signals", body={
+        "user_id": user_id,
+        "symbol": symbol.upper(),
+        "signal": signal,
+        "entry": str(entry) if entry else None,
+        "target": str(target) if target else None,
+        "stop": str(stop) if stop else None,
+        "timeframe": timeframe,
+        "price": float(price) if price else 0,
+        "registered_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+    })
+    # Use upsert via headers
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+    }
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/active_signals",
+            headers=headers,
+            json={
+                "user_id": user_id,
+                "symbol": symbol.upper(),
+                "signal": signal,
+                "entry": str(entry) if entry else None,
+                "target": str(target) if target else None,
+                "stop": str(stop) if stop else None,
+                "timeframe": timeframe,
+                "price": float(price) if price else 0,
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+            timeout=10
+        )
+        log.info(f"Signal saved: {symbol} {signal}")
+    except Exception as e:
+        log.error(f"Save signal error: {e}")
+
+def delete_signal(user_id, symbol):
+    """Remove signal from monitoring"""
+    sb_request("DELETE", "active_signals", params={
+        "user_id": f"eq.{user_id}",
+        "symbol": f"eq.{symbol.upper()}"
+    })
+
+def get_all_signals():
+    """Get all active signals from Supabase"""
+    try:
+        result = sb_request("GET", "active_signals", params={"select": "*"})
+        return result if isinstance(result, list) else []
+    except Exception as e:
+        log.error(f"Get signals error: {e}")
+        return []
 
 CIPHER_SERVER = os.environ.get("CIPHER_SERVER_URL", "https://back-end-1-928p.onrender.com")
 
@@ -306,119 +361,107 @@ Respond ONLY in JSON:
 
 def signal_monitor_loop():
     """Check all registered signals every 30 minutes"""
-    time.sleep(60)  # wait for startup
+    time.sleep(60)
     log.info("Signal monitor loop started")
     while True:
         try:
-            if not active_signals:
+            signals = get_all_signals()
+            if not signals:
+                log.info("No active signals to monitor")
                 time.sleep(1800)
                 continue
 
-            log.info(f"Monitoring {sum(len(v) for v in active_signals.values())} active signals")
+            log.info(f"Monitoring {len(signals)} active signals")
 
-            for user_id, signals in list(active_signals.items()):
-                profile = get_profile_by_user_id(user_id)
-                if not profile or not profile.get('telegram_verified'):
-                    continue
-                chat_id = profile['telegram_chat_id']
+            for stored in signals:
+                try:
+                    user_id   = stored.get('user_id')
+                    symbol    = stored.get('symbol')
+                    old_signal = stored.get('signal')
+                    entry     = stored.get('entry')
+                    tp        = stored.get('target')
+                    sl        = stored.get('stop')
+                    timeframe = stored.get('timeframe', '1h')
 
-                for symbol, stored in list(signals.items()):
+                    if not user_id or not symbol or not old_signal:
+                        continue
+
+                    # Get user's chat_id
+                    profile = get_profile_by_user_id(user_id)
+                    if not profile or not profile.get('telegram_verified'):
+                        continue
+                    chat_id = profile['telegram_chat_id']
+
+                    # Get fresh signal
+                    fresh = get_fresh_signal(symbol, timeframe)
+                    if not fresh:
+                        continue
+
+                    new_signal    = fresh.get('signal')
+                    current_price = float(str(fresh.get('entry', 0)).replace('$','') or 0)
+                    prev_emoji    = "🟢" if old_signal == "LONG" else "🔴"
+                    new_emoji     = "🟢" if new_signal == "LONG" else "🔴"
+
+                    # Check TP hit
                     try:
-                        timeframe = stored.get('timeframe', '1h')
-                        old_signal = stored.get('signal')
-                        old_entry  = stored.get('entry')
-                        tp = stored.get('target')
-                        sl = stored.get('stop')
-                        price_at_signal = float(stored.get('price', 0))
+                        tp_price = float(str(tp).replace('$','')) if tp else 0
+                        sl_price = float(str(sl).replace('$','')) if sl else 0
 
-                        # Get fresh signal
-                        fresh = get_fresh_signal(symbol, timeframe)
-                        if not fresh:
-                            continue
-
-                        new_signal = fresh.get('signal')
-                        current_price = float(fresh.get('entry', 0))
-
-                        prev_emoji = "🟢" if old_signal == "LONG" else "🔴"
-                        new_emoji  = "🟢" if new_signal == "LONG" else "🔴"
-
-                        # Check TP hit
-                        if tp and current_price and old_signal == "LONG" and current_price >= float(str(tp).replace('$','')):
-                            tg(chat_id,
-                                f"🎯 <b>TAKE PROFIT HIT — {symbol}</b>\n\n"
-                                f"Your LONG position reached TP!\n"
-                                f"Current: <b>${current_price}</b> | TP was: <b>{tp}</b>\n\n"
-                                f"Consider closing your position. 💰\n\n"
-                                f"<i>⚠️ NOT FINANCIAL ADVICE</i>"
-                            )
-                            del active_signals[user_id][symbol]
-                            continue
-
-                        if tp and current_price and old_signal == "SHORT" and current_price <= float(str(tp).replace('$','')):
-                            tg(chat_id,
-                                f"🎯 <b>TAKE PROFIT HIT — {symbol}</b>\n\n"
-                                f"Your SHORT position reached TP!\n"
-                                f"Current: <b>${current_price}</b> | TP was: <b>{tp}</b>\n\n"
-                                f"Consider closing your position. 💰\n\n"
-                                f"<i>⚠️ NOT FINANCIAL ADVICE</i>"
-                            )
-                            del active_signals[user_id][symbol]
-                            continue
+                        if tp_price and current_price:
+                            tp_hit = (old_signal == "LONG" and current_price >= tp_price) or \
+                                     (old_signal == "SHORT" and current_price <= tp_price)
+                            if tp_hit:
+                                tg(chat_id,
+                                    f"🎯 <b>TAKE PROFIT HIT — {symbol}</b>\n\n"
+                                    f"Your {old_signal} position reached TP!\n"
+                                    f"Current: <b>${current_price}</b> | TP: <b>{tp}</b>\n\n"
+                                    f"Consider closing your position. 💰\n\n"
+                                    f"<i>⚠️ NOT FINANCIAL ADVICE</i>"
+                                )
+                                delete_signal(user_id, symbol)
+                                continue
 
                         # Check SL hit
-                        if sl and current_price and old_signal == "LONG" and current_price <= float(str(sl).replace('$','')):
-                            tg(chat_id,
-                                f"🛑 <b>STOP LOSS HIT — {symbol}</b>\n\n"
-                                f"Your LONG position hit SL!\n"
-                                f"Current: <b>${current_price}</b> | SL was: <b>{sl}</b>\n\n"
-                                f"Running fresh analysis...\n\n"
-                                f"New signal: {new_emoji} <b>{new_signal}</b> ({fresh.get('confidence')}%)\n"
-                                f"📝 {fresh.get('reasoning','')}\n\n"
-                                f"<i>⚠️ NOT FINANCIAL ADVICE</i>"
-                            )
-                            del active_signals[user_id][symbol]
-                            continue
-
-                        if sl and current_price and old_signal == "SHORT" and current_price >= float(str(sl).replace('$','')):
-                            tg(chat_id,
-                                f"🛑 <b>STOP LOSS HIT — {symbol}</b>\n\n"
-                                f"Your SHORT position hit SL!\n"
-                                f"Current: <b>${current_price}</b> | SL was: <b>{sl}</b>\n\n"
-                                f"Running fresh analysis...\n\n"
-                                f"New signal: {new_emoji} <b>{new_signal}</b> ({fresh.get('confidence')}%)\n"
-                                f"📝 {fresh.get('reasoning','')}\n\n"
-                                f"<i>⚠️ NOT FINANCIAL ADVICE</i>"
-                            )
-                            del active_signals[user_id][symbol]
-                            continue
-
-                        # Check signal reversal
-                        if new_signal != "NEUTRAL" and new_signal != old_signal:
-                            tg(chat_id,
-                                f"🔄 <b>SIGNAL REVERSAL — {symbol}</b>\n\n"
-                                f"Previous: {prev_emoji} <b>{old_signal}</b>\n"
-                                f"New: {new_emoji} <b>{new_signal}</b> ({fresh.get('confidence')}% confidence)\n\n"
-                                f"📝 {fresh.get('reasoning','')}\n\n"
-                                f"🎯 New Entry: <b>{fresh.get('entry')}</b>\n"
-                                f"✅ New TP: <b>{fresh.get('target')}</b>\n"
-                                f"🛑 New SL: <b>{fresh.get('stop')}</b>\n\n"
-                                f"⚠️ Consider closing your {old_signal} position.\n\n"
-                                f"<i>⚠️ NOT FINANCIAL ADVICE</i>"
-                            )
-                            # Update stored signal to new one
-                            active_signals[user_id][symbol].update({
-                                'signal': new_signal,
-                                'entry': fresh.get('entry'),
-                                'target': fresh.get('target'),
-                                'stop': fresh.get('stop'),
-                                'price': current_price,
-                                'updated_at': datetime.now().isoformat(),
-                            })
-
-                        time.sleep(1)  # small delay between tokens
+                        if sl_price and current_price:
+                            sl_hit = (old_signal == "LONG" and current_price <= sl_price) or \
+                                     (old_signal == "SHORT" and current_price >= sl_price)
+                            if sl_hit:
+                                tg(chat_id,
+                                    f"🛑 <b>STOP LOSS HIT — {symbol}</b>\n\n"
+                                    f"Your {old_signal} position hit SL!\n"
+                                    f"Current: <b>${current_price}</b> | SL: <b>{sl}</b>\n\n"
+                                    f"Fresh analysis: {new_emoji} <b>{new_signal}</b> ({fresh.get('confidence')}%)\n"
+                                    f"📝 {fresh.get('reasoning','')}\n\n"
+                                    f"<i>⚠️ NOT FINANCIAL ADVICE</i>"
+                                )
+                                delete_signal(user_id, symbol)
+                                continue
 
                     except Exception as e:
-                        log.error(f"Monitor error for {symbol}: {e}")
+                        log.warning(f"TP/SL check error: {e}")
+
+                    # Check signal reversal
+                    if new_signal and new_signal != "NEUTRAL" and new_signal != old_signal:
+                        tg(chat_id,
+                            f"🔄 <b>SIGNAL REVERSAL — {symbol}</b>\n\n"
+                            f"Previous: {prev_emoji} <b>{old_signal}</b>\n"
+                            f"New: {new_emoji} <b>{new_signal}</b> ({fresh.get('confidence')}% confidence)\n\n"
+                            f"📝 {fresh.get('reasoning','')}\n\n"
+                            f"🎯 New Entry: <b>{fresh.get('entry')}</b>\n"
+                            f"✅ New TP: <b>{fresh.get('target')}</b>\n"
+                            f"🛑 New SL: <b>{fresh.get('stop')}</b>\n\n"
+                            f"⚠️ Consider closing your {old_signal} position.\n\n"
+                            f"<i>⚠️ NOT FINANCIAL ADVICE</i>"
+                        )
+                        # Update to new signal in Supabase
+                        save_signal(user_id, symbol, new_signal,
+                            fresh.get('entry'), fresh.get('target'),
+                            fresh.get('stop'), timeframe, current_price)
+
+                    time.sleep(1)
+
+                except Exception as e:
+                    log.error(f"Monitor error for {stored.get('symbol','?')}: {e}")
 
         except Exception as e:
             log.error(f"Signal monitor loop error: {e}")
@@ -442,39 +485,24 @@ def register_signal():
         return '', 204
     try:
         data = request.get_json()
-        user_id  = data.get('user_id')
-        symbol   = data.get('symbol', '').upper()
-        signal   = data.get('signal')
-        entry    = data.get('entry')
-        target   = data.get('target')
-        stop     = data.get('stop')
+        user_id   = data.get('user_id')
+        symbol    = data.get('symbol', '').upper()
+        signal    = data.get('signal')
+        entry     = data.get('entry')
+        target    = data.get('target')
+        stop      = data.get('stop')
         timeframe = data.get('timeframe', '1h').lower()
-        price    = data.get('price', 0)
+        price     = data.get('price', 0)
 
         if not user_id or not symbol or not signal:
             return jsonify({'error': 'user_id, symbol and signal required'}), 400
 
         if signal == 'NEUTRAL':
-            # Remove from monitoring if neutral
-            if user_id in active_signals and symbol in active_signals[user_id]:
-                del active_signals[user_id][symbol]
+            delete_signal(user_id, symbol)
             return jsonify({'status': 'removed'})
 
-        if user_id not in active_signals:
-            active_signals[user_id] = {}
-
-        active_signals[user_id][symbol] = {
-            'signal': signal,
-            'entry': entry,
-            'target': target,
-            'stop': stop,
-            'timeframe': timeframe,
-            'price': price,
-            'registered_at': datetime.now().isoformat(),
-            'updated_at': datetime.now().isoformat(),
-        }
-
-        log.info(f"Registered {signal} signal for {symbol} — user {user_id[:8]}...")
+        save_signal(user_id, symbol, signal, entry, target, stop, timeframe, price)
+        log.info(f"Signal registered: {symbol} {signal} for user {user_id[:8]}...")
         return jsonify({'status': 'registered', 'symbol': symbol, 'signal': signal})
 
     except Exception as e:
@@ -482,10 +510,10 @@ def register_signal():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/active-signals', methods=['GET'])
-def get_active_signals():
-    """Get all active signals being monitored (for debugging)"""
-    total = sum(len(v) for v in active_signals.values())
-    return jsonify({'total': total, 'users': len(active_signals)})
+def get_active_signals_route():
+    """Get all active signals being monitored"""
+    signals = get_all_signals()
+    return jsonify({'total': len(signals), 'signals': [{'symbol': s['symbol'], 'signal': s['signal']} for s in signals]})
 
 @app.route('/notify', methods=['POST'])
 def notify():
@@ -554,6 +582,285 @@ def ping():
     return jsonify({'status': 'CIPHER Notify Bot online'})
 
 # ============================================================
+# NEWS SCANNER — checks CryptoPanic every 30 mins
+# ============================================================
+CRYPTOPANIC_KEY = os.environ.get("CRYPTOPANIC_KEY", "8182afa64e0f0ccf4e3fc1a4a18a8e01ca8e329b")
+seen_news_ids = set()  # track already sent news
+
+def get_crypto_news():
+    """Fetch latest crypto news from CryptoPanic"""
+    try:
+        r = requests.get(
+            f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_KEY}&public=true&kind=news&filter=hot",
+            timeout=10
+        )
+        return r.json().get("results", [])
+    except Exception as e:
+        log.error(f"News fetch error: {e}")
+        return []
+
+def extract_symbols_from_news(news_item):
+    """Extract token symbols mentioned in news"""
+    symbols = []
+    # From CryptoPanic currencies field
+    currencies = news_item.get("currencies", [])
+    for c in currencies:
+        sym = c.get("code", "").upper()
+        if sym and len(sym) <= 10:
+            symbols.append(sym)
+    return symbols
+
+def classify_news_sentiment(title, body=""):
+    """Quick sentiment classification"""
+    text = (title + " " + body).lower()
+    negative = ["hack", "hacked", "exploit", "breach", "scam", "rug", "stolen", "attack", "vulnerability", "drain", "phishing", "fraud", "arrested", "sued", "ban", "banned", "shutdown"]
+    positive = ["launch", "listing", "partnership", "upgrade", "mainnet", "airdrop", "integration", "adoption", "etf", "approved", "record", "milestone", "institutional"]
+    
+    neg_count = sum(1 for w in negative if w in text)
+    pos_count = sum(1 for w in positive if w in text)
+    
+    if neg_count > pos_count: return "BEARISH", neg_count
+    if pos_count > neg_count: return "BULLISH", pos_count
+    return "NEUTRAL", 0
+
+def news_scanner_loop():
+    """Scan for crypto news every 30 minutes and alert on impactful news"""
+    time.sleep(90)  # wait for startup
+    log.info("News scanner loop started")
+
+    while True:
+        try:
+            news_items = get_crypto_news()
+            new_alerts = []
+
+            for item in news_items:
+                news_id = item.get("id")
+                if not news_id or news_id in seen_news_ids:
+                    continue
+
+                seen_news_ids.add(news_id)
+                title  = item.get("title", "")
+                url    = item.get("url", "")
+                source = item.get("source", {}).get("title", "Unknown")
+                symbols = extract_symbols_from_news(item)
+                sentiment, strength = classify_news_sentiment(title)
+
+                # Only alert on strong signals
+                if strength == 0 or not symbols:
+                    continue
+
+                new_alerts.append({
+                    "title": title,
+                    "url": url,
+                    "source": source,
+                    "symbols": symbols,
+                    "sentiment": sentiment,
+                    "strength": strength,
+                })
+
+            if not new_alerts:
+                time.sleep(1800)
+                continue
+
+            # Get all verified users
+            profiles = sb_request("GET", "profiles", params={
+                "telegram_verified": "eq.true",
+                "select": "user_id,telegram_chat_id,notification_prefs"
+            })
+            if not profiles:
+                time.sleep(1800)
+                continue
+
+            for alert in new_alerts:
+                sentiment = alert["sentiment"]
+                symbols   = alert["symbols"]
+                title     = alert["title"]
+                url       = alert["url"]
+                source    = alert["source"]
+
+                sent_label  = "BEARISH" if sentiment == "BEARISH" else "BULLISH" if sentiment == "BULLISH" else "NEUTRAL"
+                sent_icon   = "▼" if sentiment == "BEARISH" else "▲" if sentiment == "BULLISH" else "—"
+
+                # Run AI analysis on first symbol mentioned
+                analysis_text = ""
+                main_sym = symbols[0] if symbols else None
+                if main_sym and main_sym not in ["BTC", "ETH", "USDT", "USDC"]:
+                    try:
+                        fresh = get_fresh_signal(main_sym, "4h")
+                        if fresh and fresh.get("signal"):
+                            sig = fresh["signal"]
+                            conf = fresh.get("confidence", 0)
+                            analysis_text = (
+                                f"\n\nAI ANALYSIS — {main_sym} (4H)\n"
+                                f"Signal: {sig} ({conf}% confidence)\n"
+                                f"{fresh.get('reasoning','')}\n"
+                                f"Entry: {fresh.get('entry','—')} | TP: {fresh.get('target','—')} | SL: {fresh.get('stop','—')}"
+                            )
+                    except: pass
+
+                msg = (
+                    f"{'NEWS ALERT' if sentiment == 'NEUTRAL' else 'MARKET ALERT'} — {sent_icon} {sent_label}\n\n"
+                    f"<b>{title}</b>\n\n"
+                    f"Source: {source}\n"
+                    f"Tokens: {' '.join(symbols[:5])}\n"
+                    f"{url}"
+                    f"{analysis_text}\n\n"
+                    f"<i>NOT FINANCIAL ADVICE</i>"
+                )
+
+                # Send to all verified users
+                for p in profiles:
+                    try:
+                        chat_id = p.get("telegram_chat_id")
+                        if not chat_id: continue
+                        prefs = p.get("notification_prefs") or {}
+                        if prefs.get("news") == False: continue
+                        tg(chat_id, msg)
+                        time.sleep(0.05)
+                    except: pass
+
+            log.info(f"News scan complete — {len(new_alerts)} new alerts sent")
+
+        except Exception as e:
+            log.error(f"News scanner error: {e}")
+
+        time.sleep(1800)  # every 30 minutes
+
+# ============================================================
+# PRE-PUMP DETECTOR — scans MEXC every hour for accumulation
+# ============================================================
+pump_alerts_sent = set()  # track already alerted tokens
+
+def detect_pre_pump_signals():
+    """Detect tokens showing pre-pump accumulation patterns"""
+    try:
+        r = requests.get(f"{CIPHER_SERVER}/mexc-scan", timeout=15)
+        data = r.json()
+        if not data or "error" in data:
+            return []
+
+        suspects = []
+        for sym, d in data.items():
+            price  = d.get("price", 0)
+            change = d.get("change", 0)
+            high   = d.get("high", 0)
+            low    = d.get("low", 0)
+            vol    = d.get("volume", 0)
+
+            if not price or price <= 0: continue
+            if sym in ["USDT","USDC","BUSD","DAI"]: continue
+
+            range_pct = ((high - low) / low * 100) if low > 0 else 0
+
+            score = 0
+            signals = []
+
+            # 1. High volume but price barely moved (accumulation)
+            if vol > 0 and range_pct > 20 and abs(change) < 5:
+                score += 40
+                signals.append("High volume + price suppressed (accumulation)")
+
+            # 2. Price near 30-day low but volume spiking
+            if change < -5 and range_pct > 15:
+                score += 20
+                signals.append("Dip + volume spike (smart money buying)")
+
+            # 3. Tight range after big drop (coiling)
+            if abs(change) < 3 and range_pct > 10:
+                score += 20
+                signals.append("Tight consolidation after movement")
+
+            # 4. Very small cap + unusual range
+            if price < 0.001 and range_pct > 50:
+                score += 30
+                signals.append("Micro-cap with extreme range (high pump risk)")
+
+            if score >= 40:
+                suspects.append({
+                    "sym": sym,
+                    "price": price,
+                    "change": change,
+                    "range_pct": range_pct,
+                    "score": score,
+                    "signals": signals,
+                })
+
+        # Sort by score
+        suspects.sort(key=lambda x: x["score"], reverse=True)
+        return suspects[:10]
+
+    except Exception as e:
+        log.error(f"Pre-pump detector error: {e}")
+        return []
+
+def pre_pump_loop():
+    """Run pre-pump detector every hour"""
+    time.sleep(120)  # wait for startup
+    log.info("Pre-pump detector loop started")
+
+    while True:
+        try:
+            suspects = detect_pre_pump_signals()
+            if not suspects:
+                time.sleep(3600)
+                continue
+
+            profiles = sb_request("GET", "profiles", params={
+                "telegram_verified": "eq.true",
+                "select": "telegram_chat_id,notification_prefs"
+            })
+            if not profiles:
+                time.sleep(3600)
+                continue
+
+            for s in suspects:
+                sym = s["sym"]
+                alert_key = f"{sym}:{round(s['price'], 8)}"
+                if alert_key in pump_alerts_sent:
+                    continue
+                pump_alerts_sent.add(alert_key)
+
+                # Get AI analysis
+                analysis_text = ""
+                try:
+                    fresh = get_fresh_signal(sym, "1h")
+                    if fresh and fresh.get("signal"):
+                        analysis_text = (
+                            f"\nAI: {fresh['signal']} ({fresh.get('confidence')}%) — "
+                            f"{fresh.get('reasoning','')[:120]}..."
+                        )
+                except: pass
+
+                msg = (
+                    f"PRE-PUMP ALERT — {sym}\n\n"
+                    f"Score: {s['score']}/100\n"
+                    f"Price: ${s['price']} ({s['change']:+.2f}%)\n"
+                    f"24H Range: {s['range_pct']:.1f}%\n\n"
+                    f"Signals:\n" +
+                    "\n".join(f"  • {sig}" for sig in s["signals"]) +
+                    f"{analysis_text}\n\n"
+                    f"<b>HIGH RISK — DYOR. This may be a pump and dump.</b>\n"
+                    f"<i>NOT FINANCIAL ADVICE</i>"
+                )
+
+                for p in profiles:
+                    try:
+                        chat_id = p.get("telegram_chat_id")
+                        if not chat_id: continue
+                        prefs = p.get("notification_prefs") or {}
+                        if prefs.get("pumpalert") == False: continue
+                        tg(chat_id, msg)
+                        time.sleep(0.05)
+                    except: pass
+
+            log.info(f"Pre-pump scan done — {len(suspects)} suspects found")
+
+        except Exception as e:
+            log.error(f"Pre-pump loop error: {e}")
+
+        time.sleep(3600)  # every hour
+
+# ============================================================
 # STARTUP
 # ============================================================
 if __name__ == '__main__':
@@ -561,6 +868,8 @@ if __name__ == '__main__':
     threading.Thread(target=polling_loop, daemon=True).start()
     threading.Thread(target=keep_alive_loop, daemon=True).start()
     threading.Thread(target=signal_monitor_loop, daemon=True).start()
-    log.info("CIPHER Notification Bot started")
+    threading.Thread(target=news_scanner_loop, daemon=True).start()
+    threading.Thread(target=pre_pump_loop, daemon=True).start()
+    log.info("CIPHER Notification Bot started — all systems online")
     port = int(os.environ.get("PORT", 5002))
     app.run(host='0.0.0.0', port=port, debug=False)
