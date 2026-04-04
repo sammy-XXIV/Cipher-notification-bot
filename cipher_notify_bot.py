@@ -360,18 +360,24 @@ Respond ONLY in JSON:
         return None
 
 def signal_monitor_loop():
-    """Check all registered signals every 30 minutes"""
+    """Check signals — interval adapts to shortest active timeframe"""
     time.sleep(60)
     log.info("Signal monitor loop started")
+
+    TIMEFRAME_INTERVALS = {'15m': 300, '1h': 600, '4h': 1200, '1d': 3600, '1w': 7200}
+
     while True:
         try:
             signals = get_all_signals()
             if not signals:
                 log.info("No active signals to monitor")
-                time.sleep(1800)
+                time.sleep(600)
                 continue
 
-            log.info(f"Monitoring {len(signals)} active signals")
+            # Sleep = shortest timeframe interval of all active signals
+            active_tfs = [s.get('timeframe', '1h') for s in signals]
+            sleep_time = min(TIMEFRAME_INTERVALS.get(tf, 600) for tf in active_tfs)
+            log.info(f"Monitoring {len(signals)} signals — interval {sleep_time//60}min")
 
             for stored in signals:
                 try:
@@ -401,6 +407,95 @@ def signal_monitor_loop():
                     current_price = float(str(fresh.get('entry', 0)).replace('$','') or 0)
                     prev_emoji    = "🟢" if old_signal == "LONG" else "🔴"
                     new_emoji     = "🟢" if new_signal == "LONG" else "🔴"
+
+                    # ── LIMIT MISS DETECTION ──
+                    # Check if price never hit entry and is now running away
+                    try:
+                        entry_price   = float(str(entry).replace('$','')) if entry else 0
+                        price_at_reg  = float(str(stored.get('price', 0)) or 0)
+                        filled        = stored.get('filled', False)
+
+                        if not filled and entry_price and current_price and price_at_reg:
+                            # Calculate ATR as % of price for threshold
+                            atr_est = price_at_reg * 0.02  # 2% estimate
+
+                            # LONG limit miss — price ran UP without filling
+                            if old_signal == "LONG" and current_price > entry_price:
+                                move_pct = ((current_price - entry_price) / entry_price) * 100
+                                # Price moved up 2x ATR from entry without touching it
+                                if move_pct >= 2.0:
+                                    advice = "CHASE" if (new_signal == "LONG" and fresh.get('confidence', 0) >= 70) else "WAIT"
+                                    chase_msg = (
+                                        f"LIMIT NOT FILLED — {symbol}\n\n"
+                                        f"Your LONG limit at <b>{entry}</b> was not hit.\n"
+                                        f"Price ran up <b>+{move_pct:.1f}%</b> to <b>${current_price}</b>\n\n"
+                                    )
+                                    if advice == "CHASE":
+                                        chase_msg += (
+                                            f"AI says: CHASE IT\n"
+                                            f"Signal still LONG ({fresh.get('confidence')}% confidence)\n"
+                                            f"New entry: <b>{fresh.get('entry')}</b>\n"
+                                            f"TP: <b>{fresh.get('target')}</b> | SL: <b>{fresh.get('stop')}</b>\n\n"
+                                            f"📝 {fresh.get('reasoning','')}\n\n"
+                                            f"<i>NOT FINANCIAL ADVICE</i>"
+                                        )
+                                    else:
+                                        chase_msg += (
+                                            f"AI says: WAIT FOR PULLBACK\n"
+                                            f"Momentum weakening — wait for price to pull back\n"
+                                            f"to EMA or support before entering.\n\n"
+                                            f"📝 {fresh.get('reasoning','')}\n\n"
+                                            f"<i>NOT FINANCIAL ADVICE</i>"
+                                        )
+                                    tg(chat_id, chase_msg)
+                                    # Mark as filled to avoid repeated alerts
+                                    sb_request("PATCH", "active_signals", body={"filled": True}, params={
+                                        "user_id": f"eq.{user_id}",
+                                        "symbol":  f"eq.{symbol}"
+                                    })
+
+                            # SHORT limit miss — price ran DOWN without filling
+                            elif old_signal == "SHORT" and current_price < entry_price:
+                                move_pct = ((entry_price - current_price) / entry_price) * 100
+                                if move_pct >= 2.0:
+                                    advice = "CHASE" if (new_signal == "SHORT" and fresh.get('confidence', 0) >= 70) else "WAIT"
+                                    chase_msg = (
+                                        f"LIMIT NOT FILLED — {symbol}\n\n"
+                                        f"Your SHORT limit at <b>{entry}</b> was not hit.\n"
+                                        f"Price dropped <b>-{move_pct:.1f}%</b> to <b>${current_price}</b>\n\n"
+                                    )
+                                    if advice == "CHASE":
+                                        chase_msg += (
+                                            f"AI says: CHASE IT\n"
+                                            f"Signal still SHORT ({fresh.get('confidence')}% confidence)\n"
+                                            f"New entry: <b>{fresh.get('entry')}</b>\n"
+                                            f"TP: <b>{fresh.get('target')}</b> | SL: <b>{fresh.get('stop')}</b>\n\n"
+                                            f"📝 {fresh.get('reasoning','')}\n\n"
+                                            f"<i>NOT FINANCIAL ADVICE</i>"
+                                        )
+                                    else:
+                                        chase_msg += (
+                                            f"AI says: WAIT FOR PULLBACK\n"
+                                            f"Momentum weakening — wait for price to bounce\n"
+                                            f"to EMA or resistance before entering short.\n\n"
+                                            f"📝 {fresh.get('reasoning','')}\n\n"
+                                            f"<i>NOT FINANCIAL ADVICE</i>"
+                                        )
+                                    tg(chat_id, chase_msg)
+                                    sb_request("PATCH", "active_signals", body={"filled": True}, params={
+                                        "user_id": f"eq.{user_id}",
+                                        "symbol":  f"eq.{symbol}"
+                                    })
+
+                            # Mark as filled if price hit entry zone (within 0.5%)
+                            elif not filled and abs(current_price - entry_price) / entry_price < 0.005:
+                                sb_request("PATCH", "active_signals", body={"filled": True}, params={
+                                    "user_id": f"eq.{user_id}",
+                                    "symbol":  f"eq.{symbol}"
+                                })
+
+                    except Exception as e:
+                        log.warning(f"Limit miss check error: {e}")
 
                     # Check TP hit
                     try:
@@ -466,7 +561,7 @@ def signal_monitor_loop():
         except Exception as e:
             log.error(f"Signal monitor loop error: {e}")
 
-        time.sleep(1800)  # check every 30 minutes
+        time.sleep(sleep_time)
 
 # ============================================================
 # FLASK ROUTES — called by CIPHER web app to send notifications
