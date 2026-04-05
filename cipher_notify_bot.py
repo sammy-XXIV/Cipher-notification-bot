@@ -343,6 +343,9 @@ TIMEFRAME: {timeframe.upper()}
 Price: ${price} | RSI: {rsi} | EMA20: ${ema20} | EMA50: ${ema50}
 Trend: {trend} | ATR: ${atr} | Volume: {vol_sig}
 
+Give a directional signal. NEUTRAL should be rare — only when LONG and SHORT are perfectly balanced.
+When unsure, give LOW confidence (50-65%) LONG or SHORT based on EMA position and RSI.
+
 Respond ONLY in JSON:
 {{"signal":"LONG or SHORT or NEUTRAL","confidence":40-92,"entry":"{price}","target":"price","stop":"price","reasoning":"1-2 sentences"}}"""
 
@@ -398,20 +401,35 @@ def signal_monitor_loop():
                         continue
                     chat_id = profile['telegram_chat_id']
 
-                    # Get fresh signal
+                    # Get real current price from server ticker
+                    current_price = 0
+                    try:
+                        pr = requests.get(f"{CIPHER_SERVER}/ticker?symbol={symbol}", timeout=8)
+                        pd = pr.json()
+                        current_price = float(pd.get('price', 0) or 0)
+                    except: pass
+
+                    # Get fresh signal for analysis
                     fresh = get_fresh_signal(symbol, timeframe)
                     if not fresh:
                         continue
 
-                    new_signal    = fresh.get('signal')
-                    current_price = float(str(fresh.get('entry', 0)).replace('$','') or 0)
-                    prev_emoji    = "🟢" if old_signal == "LONG" else "🔴"
-                    new_emoji     = "🟢" if new_signal == "LONG" else "🔴"
+                    new_signal = fresh.get('signal')
+                    # Use ticker price if available, fallback to fresh signal entry
+                    if not current_price:
+                        current_price = float(str(fresh.get('entry', 0)).replace('$','') or 0)
+                    prev_emoji = "▲" if old_signal == "LONG" else "▼"
+                    new_emoji  = "▲" if new_signal == "LONG" else "▼"
 
                     # ── LIMIT MISS DETECTION ──
                     # Check if price never hit entry and is now running away
                     try:
-                        entry_price   = float(str(entry).replace('$','')) if entry else 0
+                        # Parse entry price — handle ranges like "$585-587" or text descriptions
+                        entry_str = str(entry).replace('$','').replace(',','').strip()
+                        # Extract first number found
+                        import re as _re
+                        nums = _re.findall(r'\d+\.?\d*', entry_str)
+                        entry_price = float(nums[0]) if nums else 0
                         price_at_reg  = float(str(stored.get('price', 0)) or 0)
                         filled        = stored.get('filled', False)
 
@@ -423,7 +441,7 @@ def signal_monitor_loop():
                             if old_signal == "LONG" and current_price > entry_price:
                                 move_pct = ((current_price - entry_price) / entry_price) * 100
                                 # Price moved up 2x ATR from entry without touching it
-                                if move_pct >= 2.0:
+                                if move_pct >= 0.8:
                                     advice = "CHASE" if (new_signal == "LONG" and fresh.get('confidence', 0) >= 70) else "WAIT"
                                     chase_msg = (
                                         f"LIMIT NOT FILLED — {symbol}\n\n"
@@ -457,7 +475,7 @@ def signal_monitor_loop():
                             # SHORT limit miss — price ran DOWN without filling
                             elif old_signal == "SHORT" and current_price < entry_price:
                                 move_pct = ((entry_price - current_price) / entry_price) * 100
-                                if move_pct >= 2.0:
+                                if move_pct >= 0.8:
                                     advice = "CHASE" if (new_signal == "SHORT" and fresh.get('confidence', 0) >= 70) else "WAIT"
                                     chase_msg = (
                                         f"LIMIT NOT FILLED — {symbol}\n\n"
@@ -832,8 +850,10 @@ def detect_pre_pump_signals():
         r = requests.get(f"{CIPHER_SERVER}/mexc-scan", timeout=15)
         data = r.json()
         if not data or "error" in data:
+            log.warning(f"Pre-pump: mexc-scan returned error or empty")
             return []
 
+        log.info(f"Pre-pump: scanning {len(data)} tokens")
         suspects = []
         for sym, d in data.items():
             price  = d.get("price", 0)
@@ -843,34 +863,45 @@ def detect_pre_pump_signals():
             vol    = d.get("volume", 0)
 
             if not price or price <= 0: continue
-            if sym in ["USDT","USDC","BUSD","DAI"]: continue
+            if sym in ["USDT","USDC","BUSD","DAI","FDUSD","TUSD"]: continue
+            if price < 0.0000001: continue
 
             range_pct = ((high - low) / low * 100) if low > 0 else 0
 
             score = 0
             signals = []
 
-            # 1. High volume but price barely moved (accumulation)
-            if vol > 0 and range_pct > 20 and abs(change) < 5:
+            # 1. High range but price barely moved (accumulation pattern)
+            if range_pct > 20 and abs(change) < 5:
                 score += 40
-                signals.append("High volume + price suppressed (accumulation)")
+                signals.append(f"High range {range_pct:.1f}% but price flat — accumulation")
 
-            # 2. Price near 30-day low but volume spiking
-            if change < -5 and range_pct > 15:
-                score += 20
-                signals.append("Dip + volume spike (smart money buying)")
-
-            # 3. Tight range after big drop (coiling)
-            if abs(change) < 3 and range_pct > 10:
-                score += 20
-                signals.append("Tight consolidation after movement")
-
-            # 4. Very small cap + unusual range
-            if price < 0.001 and range_pct > 50:
+            # 2. Dip + big range = smart money buying the dip
+            if change < -8 and range_pct > 20:
                 score += 30
-                signals.append("Micro-cap with extreme range (high pump risk)")
+                signals.append(f"Sharp dip {change:.1f}% + high range — potential reversal")
 
-            if score >= 40:
+            # 3. Tight range after movement (coiling for breakout)
+            if abs(change) < 2 and range_pct > 15:
+                score += 25
+                signals.append(f"Tight consolidation ({change:+.1f}%) — coiling for breakout")
+
+            # 4. Micro-cap with extreme range (pump risk)
+            if price < 0.001 and range_pct > 40:
+                score += 35
+                signals.append(f"Micro-cap ${price} with extreme range {range_pct:.0f}%")
+
+            # 5. Strong positive momentum building
+            if 5 < change < 50 and range_pct > 15:
+                score += 20
+                signals.append(f"Building momentum +{change:.1f}%")
+
+            # 6. Volume spike
+            if vol > 0 and vol > 100000:  # $100k+ volume (lowered from 500k)
+                score += 15
+                signals.append(f"Volume ${vol/1e6:.2f}M")
+
+            if score >= 25 and signals:  # lowered from 40 to 25
                 suspects.append({
                     "sym": sym,
                     "price": price,
@@ -880,8 +911,8 @@ def detect_pre_pump_signals():
                     "signals": signals,
                 })
 
-        # Sort by score
         suspects.sort(key=lambda x: x["score"], reverse=True)
+        log.info(f"Pre-pump: found {len(suspects)} suspects")
         return suspects[:10]
 
     except Exception as e:
@@ -890,14 +921,15 @@ def detect_pre_pump_signals():
 
 def pre_pump_loop():
     """Run pre-pump detector every hour"""
-    time.sleep(120)  # wait for startup
+    time.sleep(120)
     log.info("Pre-pump detector loop started")
 
     while True:
         try:
             suspects = detect_pre_pump_signals()
             if not suspects:
-                time.sleep(3600)
+                log.info("Pre-pump: no suspects this scan")
+                time.sleep(1200)
                 continue
 
             profiles = sb_request("GET", "profiles", params={
@@ -905,12 +937,16 @@ def pre_pump_loop():
                 "select": "telegram_chat_id,notification_prefs"
             })
             if not profiles:
-                time.sleep(3600)
+                log.warning("Pre-pump: no verified profiles found")
+                time.sleep(1200)
                 continue
+
+            log.info(f"Pre-pump: sending alerts to {len(profiles)} users")
 
             for s in suspects:
                 sym = s["sym"]
-                alert_key = f"{sym}:{round(s['price'], 8)}"
+                # Reset key every hour
+                alert_key = f"{sym}:{datetime.now().strftime('%Y%m%d%H')}"
                 if alert_key in pump_alerts_sent:
                     continue
                 pump_alerts_sent.add(alert_key)
@@ -927,12 +963,12 @@ def pre_pump_loop():
                 except: pass
 
                 msg = (
-                    f"PRE-PUMP ALERT — {sym}\n\n"
-                    f"Score: {s['score']}/100\n"
+                    f"🔥 <b>PRE-PUMP ALERT — {sym}</b>\n\n"
+                    f"Score: <b>{s['score']}/100</b>\n"
                     f"Price: ${s['price']} ({s['change']:+.2f}%)\n"
                     f"24H Range: {s['range_pct']:.1f}%\n\n"
-                    f"Signals:\n" +
-                    "\n".join(f"  • {sig}" for sig in s["signals"]) +
+                    f"<b>Signals:</b>\n" +
+                    "\n".join(f"• {sig}" for sig in s["signals"]) +
                     f"{analysis_text}\n\n"
                     f"<b>HIGH RISK — DYOR. This may be a pump and dump.</b>\n"
                     f"<i>NOT FINANCIAL ADVICE</i>"
@@ -942,18 +978,24 @@ def pre_pump_loop():
                     try:
                         chat_id = p.get("telegram_chat_id")
                         if not chat_id: continue
+                        # Parse prefs safely — could be dict or JSON string
                         prefs = p.get("notification_prefs") or {}
+                        if isinstance(prefs, str):
+                            try: prefs = json.loads(prefs)
+                            except: prefs = {}
                         if prefs.get("pumpalert") == False: continue
                         tg(chat_id, msg)
+                        log.info(f"Pre-pump alert sent for {sym} to {chat_id}")
                         time.sleep(0.05)
-                    except: pass
+                    except Exception as e:
+                        log.error(f"Pre-pump send error: {e}")
 
             log.info(f"Pre-pump scan done — {len(suspects)} suspects found")
 
         except Exception as e:
             log.error(f"Pre-pump loop error: {e}")
 
-        time.sleep(3600)  # every hour
+        time.sleep(1200)  # every 20 minutes
 
 # ============================================================
 # STARTUP
