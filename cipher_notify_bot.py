@@ -294,10 +294,136 @@ def get_all_signals():
 
 CIPHER_SERVER = os.environ.get("CIPHER_SERVER_URL", "https://back-end-1-928p.onrender.com")
 
-def get_fresh_signal(symbol, timeframe='1h'):
+def get_news_trade_signal(symbol, timeframe='1h', news_context=''):
+    """Run full CIPHER-style analysis and return complete trade signal"""
+    try:
+        r = requests.get(f"{CIPHER_SERVER}/candles?symbol={symbol}&interval={timeframe}&limit=80", timeout=15)
+        data = r.json()
+        candles = data.get("candles", [])
+        if not candles or len(candles) < 20:
+            return None
+
+        closes = [c["c"] for c in candles]
+        highs  = [c["h"] for c in candles]
+        lows   = [c["l"] for c in candles]
+        vols   = [c["v"] for c in candles]
+        n = len(closes)
+        price = closes[-1]
+
+        # RSI — Wilder smoothing
+        rsi = 50
+        if n >= 15:
+            avg_g = avg_l = 0
+            for i in range(1, 15):
+                d = closes[i] - closes[i-1]
+                if d > 0: avg_g += d
+                else: avg_l -= d
+            avg_g /= 14; avg_l /= 14
+            for i in range(15, n):
+                d = closes[i] - closes[i-1]
+                avg_g = (avg_g * 13 + (d if d > 0 else 0)) / 14
+                avg_l = (avg_l * 13 + (-d if d < 0 else 0)) / 14
+            rsi = round(100 - (100 / (1 + avg_g / avg_l))) if avg_l > 0 else 100
+
+        def ema_calc(data, p):
+            k = 2/(p+1); e = data[0]
+            for v in data[1:]: e = v*k + e*(1-k)
+            return round(e, 8)
+
+        ema20 = ema_calc(closes, 20) if n >= 20 else closes[-1]
+        ema50 = ema_calc(closes, 50) if n >= 50 else closes[-1]
+
+        # VWAP
+        tpv = sum(((highs[i]+lows[i]+closes[i])/3)*vols[i] for i in range(n))
+        tvol = sum(vols)
+        vwap = tpv / tvol if tvol > 0 else price
+
+        # ATR
+        trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])) for i in range(1, min(15,n))]
+        atr = sum(trs)/len(trs) if trs else 0
+
+        # MACD
+        def ema_series(data, p):
+            k = 2/(p+1); e = [data[0]]
+            for v in data[1:]: e.append(v*k + e[-1]*(1-k))
+            return e
+        macd_line = [a-b for a,b in zip(ema_series(closes,12), ema_series(closes,26))]
+        signal_line = ema_series(macd_line, 9)
+        macd = macd_line[-1] - signal_line[-1]
+        macd_pct = (macd / price * 100) if price > 0 else 0
+
+        # ADX
+        adx = 0
+        try:
+            trs2, pdm, mdm = [], [], []
+            for i in range(1, n):
+                tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+                up = highs[i]-highs[i-1]; dn = lows[i-1]-lows[i]
+                trs2.append(tr)
+                pdm.append(up if up > dn and up > 0 else 0)
+                mdm.append(dn if dn > up and dn > 0 else 0)
+            p = 14
+            if len(trs2) > p:
+                a14 = sum(trs2[:p]); pm = sum(pdm[:p]); mm = sum(mdm[:p])
+                dx = []
+                for i in range(p, len(trs2)):
+                    a14 = a14-a14/p+trs2[i]; pm = pm-pm/p+pdm[i]; mm = mm-mm/p+mdm[i]
+                    pdi = 100*pm/a14; mdi = 100*mm/a14
+                    dx.append(100*abs(pdi-mdi)/(pdi+mdi or 1))
+                adx = round(sum(dx[-14:])/min(14,len(dx)))
+        except: pass
+
+        # Support / Resistance
+        sup = min(lows[-20:])
+        res = max(highs[-20:])
+        avg_vol = sum(vols[-20:])/min(20,n)
+        vol_str = "HIGH" if vols[-1] > avg_vol*1.5 else "LOW" if vols[-1] < avg_vol*0.5 else "NORMAL"
+        trend = "BULLISH" if price > ema20 > ema50 else "BEARISH" if price < ema20 < ema50 else "MIXED"
+
+        prompt = f"""You are CIPHER, elite AI crypto analyst. Analyze {symbol} based on the following data AND the news context provided.
+
+NEWS CONTEXT:
+{news_context}
+
+The news above may create a trading opportunity. Factor it into your analysis.
+
+TIMEFRAME: {timeframe.upper()}
+Price: ${price}
+RSI(14): {rsi} {'(OVERBOUGHT)' if rsi > 70 else '(OVERSOLD)' if rsi < 30 else '(NEUTRAL)'}
+EMA20: ${ema20} — {'ABOVE (bullish)' if price > ema20 else 'BELOW (bearish)'}
+EMA50: ${ema50} — {'ABOVE (bullish)' if price > ema50 else 'BELOW (bearish)'}
+VWAP: ${round(vwap,6)} — {'ABOVE (bullish)' if price > vwap else 'BELOW (bearish)'}
+MACD: {'BULLISH' if macd > 0 else 'BEARISH'} ({macd_pct:.3f}% of price)
+ADX: {adx} {'(STRONG TREND)' if adx > 25 else '(WEAK)'}
+ATR: ${round(atr,6)} ({round(atr/price*100,2)}% of price)
+Volume: {vol_str}
+Support: ${round(sup,6)} | Resistance: ${round(res,6)}
+Trend: {trend}
+
+RULES:
+- Factor the news into direction — bullish news = favour LONG, bearish news = favour SHORT
+- Entry for LONG must be <= ${round(price,6)} (at or below current price)
+- Entry for SHORT must be >= ${round(price,6)} (at or above current price)
+- SL = 1.5x ATR from entry
+- TP = 3x ATR from entry (min 1:2 R/R)
+
+Respond ONLY in JSON:
+{{"signal":"LONG or SHORT or NEUTRAL","confidence":55-92,"entry":"price","target":"price","stop":"price","rr":"1:X","roi":"+X.X%","position_size":"X% of capital","risk":"LOW or MEDIUM or HIGH","reasoning":"3 sentences covering news impact + technicals","caution":"one caution flag"}}"""
+
+        r2 = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": os.environ.get("ANTHROPIC_API_KEY",""), "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 400, "messages": [{"role": "user", "content": prompt}]},
+            timeout=30
+        )
+        raw = r2.json()["content"][0]["text"].strip().replace("```json","").replace("```","").strip()
+        return json.loads(raw)
+
+    except Exception as e:
+        log.error(f"News trade signal error for {symbol}: {e}")
+        return None
     """Fetch fresh candles and get AI signal from CIPHER backend"""
     try:
-        # Get candles from backend
         r = requests.get(f"{CIPHER_SERVER}/candles?symbol={symbol}&interval={timeframe}&limit=80", timeout=15)
         data = r.json()
         candles = data.get("candles", [])
@@ -310,13 +436,20 @@ def get_fresh_signal(symbol, timeframe='1h'):
         vols   = [c["v"] for c in candles]
         n = len(closes)
 
-        # RSI
-        g = l = 0
-        for i in range(1, min(15, n)):
-            d = closes[-(15-i+1)] - closes[-(15-i+2)] if (15-i+2) <= n else 0
-            if d > 0: g += d
-            else: l -= d
-        rsi = round(100 - (100 / (1 + (g/l if l else 100))))
+        # RSI — proper Wilder smoothing
+        rsi = 50
+        if n >= 15:
+            avg_g = avg_l = 0
+            for i in range(1, 15):
+                d = closes[i] - closes[i-1]
+                if d > 0: avg_g += d
+                else: avg_l -= d
+            avg_g /= 14; avg_l /= 14
+            for i in range(15, n):
+                d = closes[i] - closes[i-1]
+                avg_g = (avg_g * 13 + (d if d > 0 else 0)) / 14
+                avg_l = (avg_l * 13 + (-d if d < 0 else 0)) / 14
+            rsi = round(100 - (100 / (1 + avg_g / avg_l))) if avg_l > 0 else 100
 
         # EMA
         def ema(data, p):
@@ -345,14 +478,16 @@ Trend: {trend} | ATR: ${atr} | Volume: {vol_sig}
 
 Give a directional signal. NEUTRAL should be rare — only when LONG and SHORT are perfectly balanced.
 When unsure, give LOW confidence (50-65%) LONG or SHORT based on EMA position and RSI.
+Entry must be at key support/resistance — NOT just current price.
+For SHORT: entry >= current price. For LONG: entry <= current price.
 
 Respond ONLY in JSON:
-{{"signal":"LONG or SHORT or NEUTRAL","confidence":40-92,"entry":"{price}","target":"price","stop":"price","reasoning":"1-2 sentences"}}"""
+{{"signal":"LONG or SHORT or NEUTRAL","confidence":40-92,"entry":"price at key level","target":"price","stop":"price","rr":"1:X","reasoning":"1-2 sentences"}}"""
 
         r2 = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": os.environ.get("ANTHROPIC_API_KEY",""), "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 250, "messages": [{"role": "user", "content": prompt}]},
             timeout=30
         )
         raw = r2.json()["content"][0]["text"].strip().replace("```json","").replace("```","").strip()
@@ -361,6 +496,59 @@ Respond ONLY in JSON:
     except Exception as e:
         log.error(f"get_fresh_signal error for {symbol}: {e}")
         return None
+
+
+def get_news_triggered_analysis(news_title, sentiment, symbols, is_macro):
+    """Run full analysis on best token to trade given the news"""
+    try:
+        # Pick best symbol to analyse
+        # For macro news → BTC first, then ETH
+        # For crypto news → use mentioned symbols
+        # For bearish news → look for SHORT opportunities
+        # For bullish news → look for LONG opportunities
+
+        MACRO_SYMBOLS = ["BTC", "ETH", "BNB", "SOL"]
+
+        if is_macro:
+            candidates = MACRO_SYMBOLS
+        elif symbols:
+            # Add BTC/ETH for context on crypto news too
+            candidates = list(dict.fromkeys(symbols[:3] + ["BTC"]))
+        else:
+            candidates = MACRO_SYMBOLS
+
+        best_signal = None
+        best_sym = None
+        best_tf = "1h"
+
+        for sym in candidates[:4]:
+            try:
+                sig = get_fresh_signal(sym, "1h")
+                if not sig or sig.get("signal") == "NEUTRAL":
+                    continue
+                conf = sig.get("confidence", 0)
+                # For bullish news prefer LONG signals, bearish prefer SHORT
+                direction_match = (
+                    (sentiment == "BULLISH" and sig["signal"] == "LONG") or
+                    (sentiment == "BEARISH" and sig["signal"] == "SHORT")
+                )
+                score = conf + (20 if direction_match else 0)
+                if best_signal is None or score > best_signal.get("_score", 0):
+                    sig["_score"] = score
+                    sig["_sym"] = sym
+                    best_signal = sig
+                    best_sym = sym
+                time.sleep(0.5)
+            except: continue
+
+        if not best_signal or not best_sym:
+            return None, None
+
+        return best_sym, best_signal
+
+    except Exception as e:
+        log.error(f"News triggered analysis error: {e}")
+        return None, None
 
 def signal_monitor_loop():
     """Check signals — interval adapts to shortest active timeframe"""
@@ -747,71 +935,285 @@ def ping():
     return jsonify({'status': 'CIPHER Notify Bot online'})
 
 # ============================================================
-# NEWS SCANNER — checks CryptoPanic every 30 mins
+# NEWS SCANNER — multi-source: crypto + macro + geopolitical
 # ============================================================
 CRYPTOPANIC_KEY = os.environ.get("CRYPTOPANIC_KEY", "8182afa64e0f0ccf4e3fc1a4a18a8e01ca8e329b")
-seen_news_ids = set()  # track already sent news
+seen_news_ids = set()
 
-def get_crypto_news():
-    """Fetch latest crypto news from CryptoPanic"""
+# Keywords that affect crypto markets
+BULLISH_KEYWORDS = [
+    # Crypto specific
+    "etf approved", "etf approval", "spot etf", "etf launch", "listing", "listed on",
+    "mainnet launch", "mainnet live", "launch", "partnership", "adoption", "integration",
+    "airdrop", "upgrade", "institutional", "record high", "all time high", "ath",
+    "bull", "rally", "surge", "breakout", "accumulation", "buy", "bullish",
+    "inflows", "institutional buying", "whale accumulation", "mass adoption",
+    "legal tender", "accepts bitcoin", "accepts crypto", "pays in crypto",
+    "store of value", "reserve asset", "national reserve", "strategic reserve",
+    "coinbase listing", "binance listing", "kraken listing", "okx listing",
+    "sec approves", "sec approved", "cftc approves", "regulated", "regulation clarity",
+    "staking rewards", "yield", "tvl increase", "protocol upgrade", "v2 launch", "v3 launch",
+    "layer 2", "scaling solution", "faster", "cheaper", "burn", "token burn", "buyback",
+    "partnership with", "collaboration", "deal signed", "mou signed",
+    "government adopts", "country adopts", "nation adopts", "central bank buys",
+    "hedge fund buys", "pension fund", "endowment", "sovereign wealth",
+    "bitcoin treasury", "crypto treasury", "balance sheet",
+    "positive", "growth", "expansion", "profit", "revenue increase",
+
+    # Macro bullish
+    "peace deal", "peace agreement", "ceasefire", "ceasefire agreement", "peace talks",
+    "treaty signed", "conflict resolved", "war ends", "tensions ease", "de-escalation",
+    "rate cut", "rate cuts", "interest rate cut", "fed cuts", "dovish", "pivot",
+    "fed pivot", "quantitative easing", "qe", "stimulus", "stimulus package",
+    "inflation cooling", "inflation falls", "inflation lower", "cpi drops", "cpi lower",
+    "soft landing", "no recession", "economic growth", "gdp growth", "strong jobs",
+    "unemployment falls", "trade deal", "trade agreement", "tariffs removed",
+    "sanctions lifted", "sanctions removed", "sanctions eased",
+    "deregulation", "pro crypto", "pro bitcoin", "pro innovation",
+    "risk on", "market rally", "stock market up", "s&p rally", "nasdaq rally",
+    "dollar weakens", "dxy falls", "dollar index falls", "weak dollar",
+    "oil price falls", "energy prices fall", "commodity prices fall",
+    "banking system stable", "financial stability", "liquidity injection",
+    "positive gdp", "economic recovery", "economic expansion",
+    "election victory", "pro crypto candidate wins", "pro crypto government",
+    "trump bitcoin", "trump crypto", "strategic bitcoin reserve",
+
+    # Geopolitical bullish
+    "diplomacy", "diplomatic solution", "negotiations succeed", "summit agreement",
+    "nuclear deal", "arms reduction", "military withdrawal", "troops withdraw",
+    "sanctions relief", "embargo lifted", "trade restored",
+]
+
+BEARISH_KEYWORDS = [
+    # Crypto specific
+    "hack", "hacked", "exploit", "exploited", "breach", "breached",
+    "scam", "rug pull", "rug pulled", "stolen", "theft", "drained",
+    "attack", "attacked", "vulnerability", "zero day", "phishing",
+    "fraud", "fraudulent", "ponzi", "pyramid scheme",
+    "arrested", "arrested for", "charged with", "indicted", "convicted",
+    "sued", "lawsuit", "legal action", "court order", "injunction",
+    "ban", "banned", "banning", "prohibit", "prohibited", "outlawed",
+    "shutdown", "shut down", "closed", "exit scam", "exit",
+    "delisted", "delisting", "removed from", "suspended trading",
+    "sec sues", "sec charges", "doj charges", "cftc charges",
+    "money laundering", "sanctions violation", "compliance failure",
+    "insolvency", "insolvent", "bankrupt", "bankruptcy", "chapter 11",
+    "withdrawal halt", "withdrawals paused", "withdrawals suspended",
+    "frozen", "freeze", "assets frozen", "funds frozen",
+    "crash", "crashed", "dump", "dumping", "collapse", "collapsed",
+    "death spiral", "depeg", "depegged", "stablecoin collapse",
+    "outflows", "institutional selling", "whale selling", "sell off",
+    "bear", "bearish", "downtrend", "resistance", "rejected",
+    "security breach", "private key", "seed phrase exposed",
+    "exchange collapse", "exchange bankrupt", "ftx", "celsius", "luna",
+
+    # Macro bearish
+    "war", "warfare", "military strike", "airstrike", "bombing", "invasion",
+    "nuclear threat", "nuclear weapon", "missile launch", "missile strike",
+    "terror attack", "terrorist", "assassination",
+    "rate hike", "rate hikes", "interest rate hike", "fed hikes", "hawkish",
+    "quantitative tightening", "qt", "liquidity drain",
+    "inflation spike", "inflation surges", "cpi rises", "cpi higher", "hot inflation",
+    "recession", "recessionary", "economic contraction", "gdp falls", "gdp shrinks",
+    "unemployment rises", "job losses", "layoffs massive",
+    "trade war", "tariff increase", "tariffs imposed", "trade sanctions",
+    "sanctions imposed", "new sanctions", "financial sanctions",
+    "bank failure", "bank run", "banking crisis", "financial crisis",
+    "debt ceiling", "debt default", "sovereign default", "credit downgrade",
+    "dollar strengthens", "dxy rises", "strong dollar",
+    "oil price spike", "energy crisis", "commodity shortage",
+    "market crash", "stock market crash", "black monday", "circuit breaker",
+    "pandemic", "outbreak", "lockdown", "quarantine",
+    "political crisis", "government collapse", "coup", "civil war",
+    "regulatory crackdown", "crypto ban", "bitcoin ban", "mining ban",
+    "capital controls", "currency crisis", "hyperinflation",
+    "contagion", "systemic risk", "too big to fail", "bailout needed",
+
+    # Geopolitical bearish
+    "escalation", "escalates", "tensions rise", "conflict escalates",
+    "military buildup", "troops mobilize", "naval blockade",
+    "proxy war", "regional conflict", "middle east conflict",
+    "north korea", "missile test", "nuclear test",
+    "china taiwan", "taiwan strait", "south china sea",
+    "russia ukraine", "nato conflict",
+]
+
+MACRO_KEYWORDS = [
+    # Central banks
+    "federal reserve", "fed ", "fomc", "powell", "interest rate", "rate decision",
+    "bank of england", "boe", "ecb", "european central bank", "boj", "bank of japan",
+    "inflation", "cpi", "pce", "deflation", "stagflation",
+    "quantitative easing", "quantitative tightening", "money supply",
+    "yield curve", "bond yield", "treasury yield", "10 year yield",
+
+    # Economic indicators
+    "gdp", "unemployment", "nonfarm payroll", "jobs report", "retail sales",
+    "manufacturing", "pmi", "ism", "consumer confidence", "housing data",
+    "trade balance", "current account", "budget deficit", "national debt",
+
+    # Geopolitical
+    "war", "peace", "ceasefire", "conflict", "invasion", "military",
+    "iran", "russia", "china", "usa", "ukraine", "israel", "north korea",
+    "taiwan", "nato", "g7", "g20", "united nations", "un security council",
+    "sanctions", "embargo", "trade war", "tariff",
+    "oil", "opec", "energy", "natural gas", "commodity",
+
+    # Markets
+    "s&p 500", "nasdaq", "dow jones", "stock market", "equity market",
+    "risk on", "risk off", "safe haven", "gold price", "dollar index", "dxy",
+    "emerging markets", "forex", "currency",
+
+    # Political
+    "election", "president", "congress", "senate", "parliament",
+    "trump", "biden", "administration", "policy", "executive order",
+    "regulation", "legislation", "law passed", "bill signed",
+
+    # Crypto specific macro
+    "bitcoin", "crypto", "blockchain", "defi", "cbdc", "digital currency",
+    "stablecoin", "tether", "usdc", "digital dollar",
+]
+
+def fetch_all_news():
+    """Fetch from multiple news sources"""
+    all_news = []
+
+    # 1. CryptoPanic — crypto specific
     try:
         r = requests.get(
             f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_KEY}&public=true&kind=news&filter=hot",
             timeout=10
         )
-        return r.json().get("results", [])
+        items = r.json().get("results", [])
+        for item in items:
+            all_news.append({
+                "id": f"cp_{item.get('id')}",
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "source": item.get("source", {}).get("title", "CryptoPanic"),
+                "symbols": [c.get("code","").upper() for c in item.get("currencies", []) if c.get("code")],
+                "type": "crypto"
+            })
     except Exception as e:
-        log.error(f"News fetch error: {e}")
-        return []
+        log.warning(f"CryptoPanic fetch error: {e}")
 
-def extract_symbols_from_news(news_item):
-    """Extract token symbols mentioned in news"""
-    symbols = []
-    # From CryptoPanic currencies field
-    currencies = news_item.get("currencies", [])
-    for c in currencies:
-        sym = c.get("code", "").upper()
-        if sym and len(sym) <= 10:
-            symbols.append(sym)
-    return symbols
+    # 2. CryptoPanic — also fetch important/bullish/bearish filtered
+    for filter_type in ["important", "bullish", "bearish"]:
+        try:
+            r = requests.get(
+                f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_KEY}&public=true&kind=news&filter={filter_type}",
+                timeout=10
+            )
+            items = r.json().get("results", [])
+            for item in items:
+                news_id = f"cp_{filter_type}_{item.get('id')}"
+                all_news.append({
+                    "id": news_id,
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "source": item.get("source", {}).get("title", "CryptoPanic"),
+                    "symbols": [c.get("code","").upper() for c in item.get("currencies", []) if c.get("code")],
+                    "type": f"crypto_{filter_type}"
+                })
+        except Exception as e:
+            log.warning(f"CryptoPanic {filter_type} fetch error: {e}")
 
-def classify_news_sentiment(title, body=""):
-    """Quick sentiment classification"""
-    text = (title + " " + body).lower()
-    negative = ["hack", "hacked", "exploit", "breach", "scam", "rug", "stolen", "attack", "vulnerability", "drain", "phishing", "fraud", "arrested", "sued", "ban", "banned", "shutdown"]
-    positive = ["launch", "listing", "partnership", "upgrade", "mainnet", "airdrop", "integration", "adoption", "etf", "approved", "record", "milestone", "institutional"]
-    
-    neg_count = sum(1 for w in negative if w in text)
-    pos_count = sum(1 for w in positive if w in text)
-    
-    if neg_count > pos_count: return "BEARISH", neg_count
-    if pos_count > neg_count: return "BULLISH", pos_count
-    return "NEUTRAL", 0
+    # 3. RSS feeds — macro & geopolitical (parsed as plain text)
+    rss_sources = [
+        ("https://feeds.reuters.com/reuters/businessNews", "Reuters Business"),
+        ("https://feeds.bbci.co.uk/news/business/rss.xml", "BBC Business"),
+        ("https://feeds.bloomberg.com/markets/news.rss", "Bloomberg Markets"),
+    ]
+    for rss_url, source_name in rss_sources:
+        try:
+            r = requests.get(rss_url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            if not r.ok: continue
+            content = r.text
+            # Simple RSS parsing — extract titles
+            import re as _re
+            titles = _re.findall(r'<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>', content)
+            links  = _re.findall(r'<link>(.*?)</link>', content)
+            for i, title_match in enumerate(titles[:15]):
+                title = (title_match[0] or title_match[1]).strip()
+                if not title or title == source_name: continue
+                url = links[i] if i < len(links) else rss_url
+                all_news.append({
+                    "id": f"rss_{source_name}_{hash(title)}",
+                    "title": title,
+                    "url": url,
+                    "source": source_name,
+                    "symbols": [],
+                    "type": "macro"
+                })
+        except Exception as e:
+            log.warning(f"RSS {source_name} error: {e}")
+
+    return all_news
+
+def classify_news(title, news_type="crypto"):
+    """Classify news sentiment and impact"""
+    text = title.lower()
+
+    # Count bullish/bearish keywords
+    bull_hits = [kw for kw in BULLISH_KEYWORDS if kw in text]
+    bear_hits  = [kw for kw in BEARISH_KEYWORDS if kw in text]
+    macro_hits = [kw for kw in MACRO_KEYWORDS if kw in text]
+
+    is_macro = len(macro_hits) > 0 or news_type == "macro"
+    strength = max(len(bull_hits), len(bear_hits))
+
+    if len(bear_hits) > len(bull_hits):
+        return "BEARISH", strength, is_macro, bear_hits[:3]
+    elif len(bull_hits) > len(bear_hits):
+        return "BULLISH", strength, is_macro, bull_hits[:3]
+    return "NEUTRAL", 0, is_macro, []
+
+def extract_crypto_symbols_from_title(title):
+    """Extract crypto symbols mentioned in news title"""
+    import re as _re
+    known = ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","AVAX","DOT","MATIC",
+             "LINK","UNI","AAVE","ARB","OP","SUI","APT","INJ","TIA","ATOM",
+             "LTC","BCH","ETC","FIL","ICP","NEAR","FTM","ALGO","VET","SAND",
+             "MANA","AXS","GALA","IMX","BLUR","PEPE","SHIB","FLOKI","WIF","BONK"]
+    text = title.upper()
+    found = []
+    for sym in known:
+        if sym in text or f"${sym}" in text:
+            found.append(sym)
+    return found
 
 def news_scanner_loop():
-    """Scan for crypto news every 30 minutes and alert on impactful news"""
-    time.sleep(90)  # wait for startup
-    log.info("News scanner loop started")
+    """Comprehensive news scanner — crypto + macro + geopolitical"""
+    time.sleep(90)
+    log.info("News scanner loop started — multi-source mode")
 
     while True:
         try:
-            news_items = get_crypto_news()
+            all_news = fetch_all_news()
+            log.info(f"News scanner: fetched {len(all_news)} items from all sources")
             new_alerts = []
 
-            for item in news_items:
-                news_id = item.get("id")
-                if not news_id or news_id in seen_news_ids:
+            for item in all_news:
+                news_id = item["id"]
+                if news_id in seen_news_ids:
+                    continue
+                seen_news_ids.add(news_id)
+
+                title    = item["title"]
+                url      = item["url"]
+                source   = item["source"]
+                symbols  = item.get("symbols", []) or extract_crypto_symbols_from_title(title)
+                news_type = item.get("type", "crypto")
+
+                if not title: continue
+
+                sentiment, strength, is_macro, keywords = classify_news(title, news_type)
+
+                # Skip truly neutral news with no keywords
+                if sentiment == "NEUTRAL" and not is_macro:
                     continue
 
-                seen_news_ids.add(news_id)
-                title  = item.get("title", "")
-                url    = item.get("url", "")
-                source = item.get("source", {}).get("title", "Unknown")
-                symbols = extract_symbols_from_news(item)
-                sentiment, strength = classify_news_sentiment(title)
-
-                # Only alert on strong signals
-                if strength == 0 or not symbols:
+                # Skip weak non-macro news
+                if strength == 0 and not is_macro:
                     continue
 
                 new_alerts.append({
@@ -821,11 +1223,17 @@ def news_scanner_loop():
                     "symbols": symbols,
                     "sentiment": sentiment,
                     "strength": strength,
+                    "is_macro": is_macro,
+                    "keywords": keywords,
+                    "news_type": news_type,
                 })
 
             if not new_alerts:
+                log.info("News scanner: no new alerts")
                 time.sleep(1800)
                 continue
+
+            log.info(f"News scanner: {len(new_alerts)} new alerts to send")
 
             # Get all verified users
             profiles = sb_request("GET", "profiles", params={
@@ -837,59 +1245,127 @@ def news_scanner_loop():
                 continue
 
             for alert in new_alerts:
-                sentiment = alert["sentiment"]
-                symbols   = alert["symbols"]
-                title     = alert["title"]
-                url       = alert["url"]
-                source    = alert["source"]
+                sentiment  = alert["sentiment"]
+                symbols    = alert["symbols"]
+                title      = alert["title"]
+                url        = alert["url"]
+                source     = alert["source"]
+                is_macro   = alert["is_macro"]
+                keywords   = alert["keywords"]
+                news_type  = alert["news_type"]
 
-                sent_label  = "BEARISH" if sentiment == "BEARISH" else "BULLISH" if sentiment == "BULLISH" else "NEUTRAL"
-                sent_icon   = "▼" if sentiment == "BEARISH" else "▲" if sentiment == "BULLISH" else "—"
+                sent_icon = "▲" if sentiment == "BULLISH" else "▼" if sentiment == "BEARISH" else "—"
 
-                # Run AI analysis on first symbol mentioned
+                # Determine alert type label
+                if is_macro:
+                    alert_label = "MACRO ALERT"
+                    impact = "⚠️ This affects ALL crypto — check open positions"
+                elif "important" in news_type:
+                    alert_label = "BREAKING NEWS"
+                    impact = ""
+                elif sentiment == "BEARISH":
+                    alert_label = "BEARISH ALERT"
+                    impact = ""
+                elif sentiment == "BULLISH":
+                    alert_label = "BULLISH ALERT"
+                    impact = ""
+                else:
+                    alert_label = "NEWS ALERT"
+                    impact = ""
+
+                # Run AI analysis on first mentioned symbol
+                # Run full news-triggered analysis
                 analysis_text = ""
-                main_sym = symbols[0] if symbols else None
-                if main_sym and main_sym not in ["BTC", "ETH", "USDT", "USDC"]:
-                    try:
-                        fresh = get_fresh_signal(main_sym, "4h")
-                        if fresh and fresh.get("signal"):
-                            sig = fresh["signal"]
-                            conf = fresh.get("confidence", 0)
-                            analysis_text = (
-                                f"\n\nAI ANALYSIS — {main_sym} (4H)\n"
-                                f"Signal: {sig} ({conf}% confidence)\n"
-                                f"{fresh.get('reasoning','')}\n"
-                                f"Entry: {fresh.get('entry','—')} | TP: {fresh.get('target','—')} | SL: {fresh.get('stop','—')}"
-                            )
-                    except: pass
+                trade_sym, trade_sig = get_news_triggered_analysis(
+                    title, sentiment, symbols, is_macro
+                )
+                if trade_sym and trade_sig and trade_sig.get("signal") != "NEUTRAL":
+                    sig_icon = "▲" if trade_sig["signal"] == "LONG" else "▼"
+                    analysis_text = (
+                        f"\n\n📊 <b>AUTO ANALYSIS — {trade_sym} 1H</b>\n"
+                        f"Signal: {sig_icon} <b>{trade_sig['signal']}</b> ({trade_sig.get('confidence')}% confidence)\n"
+                        f"Entry: <b>{trade_sig.get('entry','—')}</b>\n"
+                        f"TP: <b>{trade_sig.get('target','—')}</b>\n"
+                        f"SL: <b>{trade_sig.get('stop','—')}</b>\n"
+                        f"R/R: {trade_sig.get('rr','—')}\n\n"
+                        f"📝 {trade_sig.get('reasoning','')}"
+                    )
 
                 msg = (
-                    f"{'NEWS ALERT' if sentiment == 'NEUTRAL' else 'MARKET ALERT'} — {sent_icon} {sent_label}\n\n"
+                    f"{sent_icon} <b>{alert_label} — {sentiment}</b>\n\n"
                     f"<b>{title}</b>\n\n"
                     f"Source: {source}\n"
-                    f"Tokens: {' '.join(symbols[:5])}\n"
-                    f"{url}"
-                    f"{analysis_text}\n\n"
+                    + (f"Tokens: <b>{' '.join(symbols[:5])}</b>\n" if symbols else "")
+                    + (f"Why: {', '.join(keywords[:3])}\n" if keywords else "")
+                    + (f"\n{impact}\n" if impact else "")
+                    + f"\n{url}\n\n"
                     f"<i>NOT FINANCIAL ADVICE</i>"
                 )
 
-                # Send to all verified users
+                # Run full trade analysis on affected token(s)
+                trade_msgs = []
+                tokens_to_analyze = symbols[:2] if symbols else (["BTC"] if is_macro else [])
+
+                for sym in tokens_to_analyze:
+                    try:
+                        news_context = f"{sentiment} news: {title}\nSource: {source}\nKeywords: {', '.join(keywords)}"
+                        tf = "1h" if is_macro else "4h"
+                        signal = get_news_trade_signal(sym, tf, news_context)
+
+                        if signal and signal.get("signal") != "NEUTRAL":
+                            sig     = signal["signal"]
+                            conf    = signal.get("confidence", 0)
+                            entry   = signal.get("entry", "—")
+                            tp      = signal.get("target", "—")
+                            sl      = signal.get("stop", "—")
+                            rr      = signal.get("rr", "—")
+                            roi     = signal.get("roi", "—")
+                            size    = signal.get("position_size", "—")
+                            risk    = signal.get("risk", "—")
+                            reason  = signal.get("reasoning", "")
+                            caution = signal.get("caution", "")
+                            sig_icon = "▲" if sig == "LONG" else "▼"
+
+                            trade_msg = (
+                                f"{sig_icon} <b>NEWS TRADE SIGNAL — {sym}</b>\n\n"
+                                f"Signal: <b>{sig}</b> ({conf}% confidence)\n"
+                                f"Timeframe: {tf.upper()} | Risk: {risk}\n\n"
+                                f"Entry: <b>{entry}</b>\n"
+                                f"TP: <b>{tp}</b> ({roi})\n"
+                                f"SL: <b>{sl}</b>\n"
+                                f"R/R: {rr} | Size: {size}\n\n"
+                                f"📝 {reason}\n"
+                                + (f"⚠️ {caution}\n" if caution else "")
+                                + f"\n<i>NOT FINANCIAL ADVICE</i>"
+                            )
+                            trade_msgs.append(trade_msg)
+                    except Exception as e:
+                        log.error(f"Trade signal error for {sym}: {e}")
+
                 for p in profiles:
                     try:
                         chat_id = p.get("telegram_chat_id")
                         if not chat_id: continue
                         prefs = p.get("notification_prefs") or {}
+                        if isinstance(prefs, str):
+                            try: prefs = json.loads(prefs)
+                            except: prefs = {}
                         if prefs.get("news") == False: continue
+                        # Send news alert first
                         tg(chat_id, msg)
-                        time.sleep(0.05)
+                        time.sleep(0.3)
+                        # Then send trade signals
+                        for trade_msg in trade_msgs:
+                            tg(chat_id, trade_msg)
+                            time.sleep(0.3)
                     except: pass
 
-            log.info(f"News scan complete — {len(new_alerts)} new alerts sent")
+            log.info(f"News scan complete — {len(new_alerts)} alerts sent")
 
         except Exception as e:
             log.error(f"News scanner error: {e}")
 
-        time.sleep(1800)  # every 30 minutes
+        time.sleep(900)  # every 15 minutes
 
 # ============================================================
 # PRE-PUMP DETECTOR — scans MEXC every hour for accumulation
