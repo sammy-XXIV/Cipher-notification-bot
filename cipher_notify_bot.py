@@ -367,20 +367,30 @@ def signal_monitor_loop():
     time.sleep(60)
     log.info("Signal monitor loop started")
 
-    TIMEFRAME_INTERVALS = {'15m': 300, '1h': 600, '4h': 1200, '1d': 3600, '1w': 7200}
+    # Much faster intervals — SL hits happen in minutes not hours
+    TIMEFRAME_INTERVALS = {'5m': 60, '15m': 120, '1h': 180, '4h': 300, '1d': 600, '1w': 1200}
+    # Major tokens that move fast — always check every 2 minutes
+    MAJOR_TOKENS = {'BTC','ETH','BNB','SOL','XRP','ADA','AVAX','DOGE','DOT','MATIC','ARB','OP'}
 
     while True:
         try:
             signals = get_all_signals()
             if not signals:
                 log.info("No active signals to monitor")
-                time.sleep(600)
+                time.sleep(120)
                 continue
 
-            # Sleep = shortest timeframe interval of all active signals
-            active_tfs = [s.get('timeframe', '1h') for s in signals]
-            sleep_time = min(TIMEFRAME_INTERVALS.get(tf, 600) for tf in active_tfs)
-            log.info(f"Monitoring {len(signals)} signals — interval {sleep_time//60}min")
+            # If any signal is a major token, use 2 min interval regardless
+            symbols = [s.get('symbol','') for s in signals]
+            has_major = any(sym in MAJOR_TOKENS for sym in symbols)
+
+            if has_major:
+                sleep_time = 120  # 2 minutes for major tokens
+            else:
+                active_tfs = [s.get('timeframe', '1h') for s in signals]
+                sleep_time = min(TIMEFRAME_INTERVALS.get(tf, 180) for tf in active_tfs)
+
+            log.info(f"Monitoring {len(signals)} signals — next check in {sleep_time}s")
 
             for stored in signals:
                 try:
@@ -517,8 +527,16 @@ def signal_monitor_loop():
 
                     # Check TP hit
                     try:
-                        tp_price = float(str(tp).replace('$','')) if tp else 0
-                        sl_price = float(str(sl).replace('$','')) if sl else 0
+                        import re as _re
+                        def parse_price(s):
+                            """Extract first number from price string like '$69,200' or '$68,200-68,300 zone'"""
+                            if not s: return 0
+                            nums = _re.findall(r'[\d,]+\.?\d*', str(s).replace('$',''))
+                            if not nums: return 0
+                            return float(nums[0].replace(',',''))
+
+                        tp_price = parse_price(tp)
+                        sl_price = parse_price(sl)
 
                         if tp_price and current_price:
                             tp_hit = (old_signal == "LONG" and current_price >= tp_price) or \
@@ -529,7 +547,7 @@ def signal_monitor_loop():
                                     f"Your {old_signal} position reached TP!\n"
                                     f"Current: <b>${current_price}</b> | TP: <b>{tp}</b>\n\n"
                                     f"Consider closing your position. 💰\n\n"
-                                    f"<i>⚠️ NOT FINANCIAL ADVICE</i>"
+                                    f"<i>NOT FINANCIAL ADVICE</i>"
                                 )
                                 delete_signal(user_id, symbol)
                                 continue
@@ -543,9 +561,9 @@ def signal_monitor_loop():
                                     f"🛑 <b>STOP LOSS HIT — {symbol}</b>\n\n"
                                     f"Your {old_signal} position hit SL!\n"
                                     f"Current: <b>${current_price}</b> | SL: <b>{sl}</b>\n\n"
-                                    f"Fresh analysis: {new_emoji} <b>{new_signal}</b> ({fresh.get('confidence')}%)\n"
+                                    f"Fresh signal: {new_emoji} <b>{new_signal}</b> ({fresh.get('confidence')}%)\n"
                                     f"📝 {fresh.get('reasoning','')}\n\n"
-                                    f"<i>⚠️ NOT FINANCIAL ADVICE</i>"
+                                    f"<i>NOT FINANCIAL ADVICE</i>"
                                 )
                                 delete_signal(user_id, symbol)
                                 continue
@@ -556,32 +574,32 @@ def signal_monitor_loop():
                     # ── ADVERSE MOVE ALERT — price moving against position ──
                     try:
                         price_at_signal = float(str(stored.get('price', 0)) or 0)
-                        if price_at_signal > 0 and current_price > 0 and stored.get('filled'):
+                        # Lower threshold for major tokens — they move faster
+                        adverse_threshold = 1.5 if symbol in MAJOR_TOKENS else 3.0
+                        if price_at_signal > 0 and current_price > 0:
                             adverse_key = f"adverse:{user_id}:{symbol}"
                             if old_signal == "SHORT":
                                 adverse_pct = ((current_price - price_at_signal) / price_at_signal) * 100
-                                if adverse_pct >= 5 and adverse_key not in pump_alerts_sent:
+                                if adverse_pct >= adverse_threshold and adverse_key not in pump_alerts_sent:
                                     pump_alerts_sent.add(adverse_key)
                                     tg(chat_id,
                                         f"⚠️ <b>ADVERSE MOVE — {symbol}</b>\n\n"
                                         f"Your SHORT is moving against you!\n"
-                                        f"Entry: <b>${price_at_signal}</b>\n"
+                                        f"Signal price: <b>${price_at_signal}</b>\n"
                                         f"Current: <b>${current_price}</b> (+{adverse_pct:.1f}%)\n\n"
-                                        f"Consider closing to protect your capital.\n"
-                                        f"SL: <b>{sl}</b>\n\n"
+                                        f"SL is at <b>{sl}</b> — consider closing now to limit losses.\n\n"
                                         f"<i>NOT FINANCIAL ADVICE</i>"
                                     )
                             elif old_signal == "LONG":
                                 adverse_pct = ((price_at_signal - current_price) / price_at_signal) * 100
-                                if adverse_pct >= 5 and adverse_key not in pump_alerts_sent:
+                                if adverse_pct >= adverse_threshold and adverse_key not in pump_alerts_sent:
                                     pump_alerts_sent.add(adverse_key)
                                     tg(chat_id,
                                         f"⚠️ <b>ADVERSE MOVE — {symbol}</b>\n\n"
                                         f"Your LONG is moving against you!\n"
-                                        f"Entry: <b>${price_at_signal}</b>\n"
+                                        f"Signal price: <b>${price_at_signal}</b>\n"
                                         f"Current: <b>${current_price}</b> (-{adverse_pct:.1f}%)\n\n"
-                                        f"Consider closing to protect your capital.\n"
-                                        f"SL: <b>{sl}</b>\n\n"
+                                        f"SL is at <b>{sl}</b> — consider closing now to limit losses.\n\n"
                                         f"<i>NOT FINANCIAL ADVICE</i>"
                                     )
                     except Exception as e:
