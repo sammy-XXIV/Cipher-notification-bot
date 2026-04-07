@@ -553,6 +553,40 @@ def signal_monitor_loop():
                     except Exception as e:
                         log.warning(f"TP/SL check error: {e}")
 
+                    # ── ADVERSE MOVE ALERT — price moving against position ──
+                    try:
+                        price_at_signal = float(str(stored.get('price', 0)) or 0)
+                        if price_at_signal > 0 and current_price > 0 and stored.get('filled'):
+                            adverse_key = f"adverse:{user_id}:{symbol}"
+                            if old_signal == "SHORT":
+                                adverse_pct = ((current_price - price_at_signal) / price_at_signal) * 100
+                                if adverse_pct >= 5 and adverse_key not in pump_alerts_sent:
+                                    pump_alerts_sent.add(adverse_key)
+                                    tg(chat_id,
+                                        f"⚠️ <b>ADVERSE MOVE — {symbol}</b>\n\n"
+                                        f"Your SHORT is moving against you!\n"
+                                        f"Entry: <b>${price_at_signal}</b>\n"
+                                        f"Current: <b>${current_price}</b> (+{adverse_pct:.1f}%)\n\n"
+                                        f"Consider closing to protect your capital.\n"
+                                        f"SL: <b>{sl}</b>\n\n"
+                                        f"<i>NOT FINANCIAL ADVICE</i>"
+                                    )
+                            elif old_signal == "LONG":
+                                adverse_pct = ((price_at_signal - current_price) / price_at_signal) * 100
+                                if adverse_pct >= 5 and adverse_key not in pump_alerts_sent:
+                                    pump_alerts_sent.add(adverse_key)
+                                    tg(chat_id,
+                                        f"⚠️ <b>ADVERSE MOVE — {symbol}</b>\n\n"
+                                        f"Your LONG is moving against you!\n"
+                                        f"Entry: <b>${price_at_signal}</b>\n"
+                                        f"Current: <b>${current_price}</b> (-{adverse_pct:.1f}%)\n\n"
+                                        f"Consider closing to protect your capital.\n"
+                                        f"SL: <b>{sl}</b>\n\n"
+                                        f"<i>NOT FINANCIAL ADVICE</i>"
+                                    )
+                    except Exception as e:
+                        log.warning(f"Adverse move check error: {e}")
+
                     # Check signal reversal
                     if new_signal and new_signal != "NEUTRAL" and new_signal != old_signal:
                         tg(chat_id,
